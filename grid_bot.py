@@ -24,12 +24,11 @@ _crypto_data_client = None
 _requests_mod = None
 
 def _init_price_clients():
-    """Lazy-Init für Market-Data-Clients und request-Objekte (verschiedene SDK-Versionen möglich)."""
+    """Initialisiert Market-Data-Clients (unterstützt mehrere Alpaca-SDK-Versionen)."""
     global _last_price_clients_inited, _crypto_data_client, _requests_mod
     if _last_price_clients_inited:
         return
     try:
-        # Neues alpaca-py API (v3+)
         from alpaca.data import CryptoDataClient  # type: ignore
         from alpaca.data import requests as data_requests  # type: ignore
         _crypto_data_client = CryptoDataClient()
@@ -62,7 +61,7 @@ trading = TradingClient(API_KEY, API_SECRET, paper=USE_PAPER)
 
 # ========= Utilities =========
 def unique_cid(prefix: str, price: float) -> str:
-    # kurze, aber eindeutige CID – inkl. Preis und 8-stelliger UUID
+    """Erzeugt eindeutige Client-Order-IDs."""
     return f"{prefix}-{price:.1f}-{uuid.uuid4().hex[:8]}"
 
 def now_utc() -> datetime:
@@ -76,41 +75,31 @@ def get_last_price(symbol: str) -> float | None:
     """Versucht mehrere Wege, den letzten Preis zu holen. Gibt None, wenn alles fehlschlägt."""
     _init_price_clients()
 
-    # 1) Neues alpaca.data: get_latest_trade
     if _crypto_data_client and _requests_mod:
+        # 1️⃣ get_latest_trade
         try:
             req = _requests_mod.CryptoLatestTradeRequest(symbol_or_symbols=symbol)
             res = _crypto_data_client.get_latest_trade(req)
-            # Rückgabe kann dict-ähnlich sein (bei mehreren Symbolen) – abdecken
-            price = None
             if hasattr(res, "price"):
-                price = float(res.price)
-            elif isinstance(res, dict):
-                obj = res.get(symbol)
-                if obj and hasattr(obj, "price"):
-                    price = float(obj.price)
-            if price:
-                return price
+                return float(res.price)
+            elif isinstance(res, dict) and symbol in res:
+                return float(res[symbol].price)
         except Exception:
             pass
-
-        # 2) Fallback: get_latest_quote (Midprice)
+        # 2️⃣ get_latest_quote (Midprice)
         try:
             req = _requests_mod.CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
             res = _crypto_data_client.get_latest_quote(req)
             bid, ask = None, None
             if hasattr(res, "bid_price") and hasattr(res, "ask_price"):
                 bid, ask = float(res.bid_price), float(res.ask_price)
-            elif isinstance(res, dict):
-                obj = res.get(symbol)
-                if obj and hasattr(obj, "bid_price") and hasattr(obj, "ask_price"):
-                    bid, ask = float(obj.bid_price), float(obj.ask_price)
+            elif isinstance(res, dict) and symbol in res:
+                bid, ask = float(res[symbol].bid_price), float(res[symbol].ask_price)
             if bid and ask:
                 return (bid + ask) / 2.0
         except Exception:
             pass
 
-    # Letzter Fallback: keine Quelle verfügbar
     return None
 
 # ========= Grid-Level Berechnung =========
@@ -119,7 +108,6 @@ def build_grid_levels(low: float, high: float, step: float) -> List[float]:
         return []
     levels = []
     p = low
-    # mathematische Stabilität bei Gleitkomma
     while p <= high + 1e-9:
         levels.append(round(p, 1))
         p += step
@@ -127,69 +115,57 @@ def build_grid_levels(low: float, high: float, step: float) -> List[float]:
 
 # ========= Order-Status Helpers =========
 def get_open_grid_buy_prices(symbol: str) -> Set[float]:
-    """Offene BUY-Limit-Orders unseres Grids (erkannt am CID-Prefix 'GRIDBUY-')."""
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
     prices: Set[float] = set()
     try:
         for o in trading.get_orders(filter=req):
-            if o.side == OrderSide.BUY and o.type == OrderType.LIMIT and o.client_order_id and str(o.client_order_id).startswith("GRIDBUY-"):
-                try:
-                    prices.add(float(o.limit_price))
-                except Exception:
-                    pass
+            if o.side == OrderSide.BUY and o.type == OrderType.LIMIT and str(o.client_order_id).startswith("GRIDBUY-"):
+                prices.add(float(o.limit_price))
     except Exception as e:
         print(f"[WARN] get_open_grid_buy_prices: {e}", flush=True)
     return prices
 
 def get_open_grid_tp_prices(symbol: str) -> Set[float]:
-    """Offene SELL-Limit-Orders als TPs (CID-Prefix 'GRIDTP-') → liefert limit prices."""
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
     prices: Set[float] = set()
     try:
         for o in trading.get_orders(filter=req):
-            if o.side == OrderSide.SELL and o.type == OrderType.LIMIT and o.client_order_id and str(o.client_order_id).startswith("GRIDTP-"):
-                try:
-                    prices.add(float(o.limit_price))
-                except Exception:
-                    pass
+            if o.side == OrderSide.SELL and o.type == OrderType.LIMIT and str(o.client_order_id).startswith("GRIDTP-"):
+                prices.add(float(o.limit_price))
     except Exception as e:
         print(f"[WARN] get_open_grid_tp_prices: {e}", flush=True)
     return prices
 
 def get_recent_filled_grid_buys(symbol: str, lookback_sec: int = 1800) -> List[tuple[float, float]]:
-    """
-    Liefert Liste (entry_price, filled_qty) kürzlich ERFOLGREICH ausgeführter Grid-BUY-Orders.
-    Erkennung: CID startet mit 'GRIDBUY-'.
-    """
     since = now_utc() - timedelta(seconds=lookback_sec)
-    req = GetOrdersRequest(
-        status=QueryOrderStatus.CLOSED,
-        symbols=[symbol],
-        side=OrderSide.BUY,
-        after=since,
-    )
+    req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], side=OrderSide.BUY, after=since)
     out: List[tuple[float, float]] = []
     try:
         for o in trading.get_orders(filter=req):
-            if not (o.client_order_id and str(o.client_order_id).startswith("GRIDBUY-")):
+            if not str(o.client_order_id).startswith("GRIDBUY-"):
                 continue
             if not o.filled_qty or float(o.filled_qty) <= 0:
                 continue
-            try:
-                entry = float(o.limit_price)
-                qty = float(o.filled_qty)
-                out.append((entry, qty))
-            except Exception:
-                pass
+            out.append((float(o.limit_price), float(o.filled_qty)))
     except Exception as e:
         print(f"[WARN] get_recent_filled_grid_buys: {e}", flush=True)
     return out
 
+# ========= Verfügbare USD =========
+def get_available_usd() -> float:
+    try:
+        acct = trading.get_account()
+        return float(getattr(acct, "cash", 0))
+    except Exception as e:
+        print(f"[WARN] get_available_usd: {e}", flush=True)
+        return 0.0
+
 # ========= Order-Platzierung =========
 def submit_grid_buys(symbol: str, target_prices: List[float], qty: float, max_orders: int) -> int:
-    """Platziert NUR fehlende Level (Duplikate werden übersprungen)."""
     already_open = get_open_grid_buy_prices(symbol)
     to_place = [p for p in target_prices if p not in already_open]
+
+    usd_left = get_available_usd()
     placed = 0
 
     if not to_place:
@@ -198,6 +174,11 @@ def submit_grid_buys(symbol: str, target_prices: List[float], qty: float, max_or
 
     for p in to_place:
         if placed >= max_orders:
+            break
+        needed = p * qty
+        if usd_left < needed:
+            print(f"[BOT] Budget erschöpft (benötigt {needed:.2f} USD, verfügbar {usd_left:.2f}). "
+                  "Weitere BUYs werden übersprungen.", flush=True)
             break
         try:
             req = LimitOrderRequest(
@@ -210,8 +191,9 @@ def submit_grid_buys(symbol: str, target_prices: List[float], qty: float, max_or
                 client_order_id=unique_cid("GRIDBUY", p),
             )
             trading.submit_order(req)
-            print(f"[ORDER] BUY-LIMIT {symbol} @ {p} qty={qty} (cid={req.client_order_id})", flush=True)
+            usd_left -= needed
             placed += 1
+            print(f"[ORDER] BUY-LIMIT {symbol} @ {p} qty={qty} (cid={req.client_order_id})", flush=True)
         except Exception as e:
             print(f"[ERR] submit_limit_buy: {e}", flush=True)
 
@@ -221,10 +203,6 @@ def submit_grid_buys(symbol: str, target_prices: List[float], qty: float, max_or
     return placed
 
 def submit_tp_sells_for_fills(symbol: str, tp_pct: float, max_orders: int) -> int:
-    """
-    Für kürzlich gefüllte Grid-BUYs die TP-SELL-Limit-Orders nachlegen.
-    TP-Preis = entry*(1+tp_pct). Duplikate (gleicher Limit-Preis) werden übersprungen.
-    """
     open_tp = get_open_grid_tp_prices(symbol)
     fills = get_recent_filled_grid_buys(symbol, lookback_sec=3600)
     placed = 0
@@ -245,8 +223,8 @@ def submit_tp_sells_for_fills(symbol: str, tp_pct: float, max_orders: int) -> in
                 client_order_id=unique_cid("GRIDTP", tp_price),
             )
             trading.submit_order(req)
-            print(f"[TP] SELL-LIMIT {symbol} @ {fmt(tp_price)} qty={qty} (entry={fmt(entry_price)})", flush=True)
             placed += 1
+            print(f"[TP] SELL-LIMIT {symbol} @ {fmt(tp_price)} qty={qty} (entry={fmt(entry_price)})", flush=True)
         except Exception as e:
             print(f"[ERR] submit_tp_sell: {e}", flush=True)
     if placed == 0:
@@ -255,7 +233,6 @@ def submit_tp_sells_for_fills(symbol: str, tp_pct: float, max_orders: int) -> in
 
 # ========= Wartung =========
 def cancel_open_grid_orders(symbol: str) -> int:
-    """Storniert **nur** unsere Grid-Orders (BUY + TP), anhand CID-Präfix."""
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
     canceled = 0
     try:
@@ -273,20 +250,15 @@ def cancel_open_grid_orders(symbol: str) -> int:
 
 # ========= Main-Loop =========
 def one_round():
-    # Preis
     last = get_last_price(SYMBOL)
     last_txt = fmt(last) if last is not None else "—"
 
-    # Grid
     levels = build_grid_levels(GRID_LOW, GRID_HIGH, STEP)
     print(f"[BOT] Grid-Start • Symbol={SYMBOL} • Range={GRID_LOW}-{GRID_HIGH} • TP={TP_PCT*100:.1f}% • QTY/Level={QTY}", flush=True)
     print(f"[BOT] Last={last_txt}", flush=True)
 
-    # BUY-Levels nur innerhalb Range
     buys = [p for p in levels if p <= GRID_HIGH]
     submit_grid_buys(SYMBOL, buys, QTY, MAX_ORDERS_PER_LOOP)
-
-    # TPs für neue Fills
     submit_tp_sells_for_fills(SYMBOL, TP_PCT, max_orders=MAX_ORDERS_PER_LOOP)
 
     print("[BOT] Runde fertig.", flush=True)
@@ -297,10 +269,8 @@ def main():
         n = cancel_open_grid_orders(SYMBOL)
         print(f"[BOT] {n} offene Orders storniert.", flush=True)
 
-    # sofort eine Runde
     one_round()
 
-    # Dauerloop (Render-Worker-Restyle)
     if any(arg in os.getenv("LOOP", "--loop") for arg in ["--loop", "1", "true"]):
         while True:
             try:
