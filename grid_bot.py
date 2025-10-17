@@ -3,20 +3,12 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Set
+from typing import List, Set, Tuple, Optional
 
 # ===== Alpaca Trading (Orders) =====
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    GetOrdersRequest,
-    LimitOrderRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    OrderType,
-    TimeInForce,
-    QueryOrderStatus,
-)
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, OrderType, TimeInForce, QueryOrderStatus
 
 # ===== Alpaca Market Data (Preis) – robust mit Fallbacks =====
 _last_price_clients_inited = False
@@ -38,7 +30,6 @@ def _init_price_clients():
         _requests_mod = None
     _last_price_clients_inited = True
 
-
 # ========= Konfiguration =========
 API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or ""
 API_SECRET = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY") or ""
@@ -50,18 +41,28 @@ GRID_LOW = float(os.getenv("GRID_LOW", "4000"))
 GRID_HIGH = float(os.getenv("GRID_HIGH", "4400"))
 STEP = float(os.getenv("STEP", "40"))
 
-TP_PCT = float(os.getenv("TP_PCT", "0.005"))  # 0.5% = 0.005
+TP_PCT = float(os.getenv("TP_PCT", "0.005"))   # 0.5% = 0.005
 QTY = float(os.getenv("QTY", "0.01"))
 
 MAX_ORDERS_PER_LOOP = int(os.getenv("MAX_ORDERS_PER_LOOP", "25"))
 REBUILD_ON_START = str(os.getenv("REBUILD_ON_START", "true")).lower() in ["1", "true", "yes", "y"]
 SLEEP_SEC = int(os.getenv("SLEEP_SEC", "20"))
 
+# --- Auto-Recenter Einstellungen ---
+AUTO_RECENTER = str(os.getenv("AUTO_RECENTER", "true")).lower() in ["1", "true", "yes", "y"]
+RECENTER_BUFFER_PCT = float(os.getenv("RECENTER_BUFFER_PCT", "0.10"))  # 10% außerhalb Range nötig
+RECENTER_MODE = os.getenv("RECENTER_MODE", "center").lower()           # "center" oder "edge"
+RECENTER_COOLDOWN_SEC = int(os.getenv("RECENTER_COOLDOWN_SEC", "300")) # mind. 5 Min. zwischen Recenter
+
+# In-Memory State
+_last_recenter_at: Optional[datetime] = None
+_cur_low = GRID_LOW
+_cur_high = GRID_HIGH
+
 trading = TradingClient(API_KEY, API_SECRET, paper=USE_PAPER)
 
 # ========= Utilities =========
 def unique_cid(prefix: str, price: float) -> str:
-    """Erzeugt eindeutige Client-Order-IDs."""
     return f"{prefix}-{price:.1f}-{uuid.uuid4().hex[:8]}"
 
 def now_utc() -> datetime:
@@ -70,13 +71,16 @@ def now_utc() -> datetime:
 def fmt(x: float) -> str:
     return f"{x:.2f}"
 
+def width(low: float, high: float) -> float:
+    return max(0.0, high - low)
+
 # ========= Preisabfrage =========
-def get_last_price(symbol: str) -> float | None:
+def get_last_price(symbol: str) -> Optional[float]:
     """Versucht mehrere Wege, den letzten Preis zu holen. Gibt None, wenn alles fehlschlägt."""
     _init_price_clients()
 
+    # 1) Latest Trade
     if _crypto_data_client and _requests_mod:
-        # 1️⃣ get_latest_trade
         try:
             req = _requests_mod.CryptoLatestTradeRequest(symbol_or_symbols=symbol)
             res = _crypto_data_client.get_latest_trade(req)
@@ -86,7 +90,8 @@ def get_last_price(symbol: str) -> float | None:
                 return float(res[symbol].price)
         except Exception:
             pass
-        # 2️⃣ get_latest_quote (Midprice)
+
+        # 2) Latest Quote (Mid)
         try:
             req = _requests_mod.CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
             res = _crypto_data_client.get_latest_quote(req)
@@ -106,7 +111,7 @@ def get_last_price(symbol: str) -> float | None:
 def build_grid_levels(low: float, high: float, step: float) -> List[float]:
     if high <= low or step <= 0:
         return []
-    levels = []
+    levels: List[float] = []
     p = low
     while p <= high + 1e-9:
         levels.append(round(p, 1))
@@ -136,10 +141,10 @@ def get_open_grid_tp_prices(symbol: str) -> Set[float]:
         print(f"[WARN] get_open_grid_tp_prices: {e}", flush=True)
     return prices
 
-def get_recent_filled_grid_buys(symbol: str, lookback_sec: int = 1800) -> List[tuple[float, float]]:
+def get_recent_filled_grid_buys(symbol: str, lookback_sec: int = 3600) -> List[Tuple[float, float]]:
     since = now_utc() - timedelta(seconds=lookback_sec)
     req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], side=OrderSide.BUY, after=since)
-    out: List[tuple[float, float]] = []
+    out: List[Tuple[float, float]] = []
     try:
         for o in trading.get_orders(filter=req):
             if not str(o.client_order_id).startswith("GRIDBUY-"):
@@ -248,29 +253,113 @@ def cancel_open_grid_orders(symbol: str) -> int:
         print(f"[WARN] cancel_open_grid_orders: {e}", flush=True)
     return canceled
 
+# ========= Auto-Recenter =========
+def should_recenter(last: Optional[float], low: float, high: float) -> bool:
+    if not AUTO_RECENTER or last is None:
+        return False
+    w = width(low, high)
+    if w <= 0:
+        return False
+    buffer = w * RECENTER_BUFFER_PCT
+    below = last < (low - buffer)
+    above = last > (high + buffer)
+    if not (below or above):
+        return False
+    global _last_recenter_at
+    if _last_recenter_at and (now_utc() - _last_recenter_at).total_seconds() < RECENTER_COOLDOWN_SEC:
+        # Cooldown aktiv
+        return False
+    return True
+
+def recenter_range_around(last: float, low: float, high: float) -> Tuple[float, float]:
+    """Berechnet ein neues [low, high] anhand RECENTER_MODE."""
+    w = width(low, high)
+    if w <= 0:
+        # Fallback: Standardbreite 10 * STEP
+        w = max(STEP * 10, STEP)
+    half = w / 2.0
+
+    if RECENTER_MODE == "edge":
+        # Preis an die untere/obere Kante setzen, Range beibehalten
+        if last < low:
+            new_low = round(last, 1)
+            new_high = round(last + w, 1)
+        else:
+            new_low = round(last - w, 1)
+            new_high = round(last, 1)
+    else:
+        # center (Standard): symmetrisch um den Preis
+        new_low = round(last - half, 1)
+        new_high = round(last + half, 1)
+
+    # Levels auf STEP ausrichten (Snap)
+    snapped_low = round(round((new_low - low) / STEP) * STEP + low, 1) if STEP > 0 else new_low
+    # Tauschen, falls Snap schief geht
+    if snapped_low >= new_high:
+        snapped_low = new_low
+    return snapped_low, new_high
+
+def apply_recenter_if_needed(last: Optional[float]) -> Tuple[float, float, bool]:
+    """Aktualisiert den globalen Range, storniert Orders und signalisiert, ob recentered wurde."""
+    global _cur_low, _cur_high, _last_recenter_at
+    if not should_recenter(last, _cur_low, _cur_high):
+        return _cur_low, _cur_high, False
+
+    assert last is not None
+    new_low, new_high = recenter_range_around(last, _cur_low, _cur_high)
+    # Cancel und übernehmen
+    canceled = cancel_open_grid_orders(SYMBOL)
+    _cur_low, _cur_high = new_low, new_high
+    _last_recenter_at = now_utc()
+
+    print(
+        f"[BOT] AUTO-RECENTER → Preis {fmt(last)} liegt außerhalb Range "
+        f"({fmt(_cur_low)}-{fmt(_cur_high)}) mit Buffer={RECENTER_BUFFER_PCT*100:.1f}%."
+        f" {canceled} offene Grid-Orders storniert. Neuer Range: {fmt(new_low)}-{fmt(new_high)}",
+        flush=True,
+    )
+    return _cur_low, _cur_high, True
+
 # ========= Main-Loop =========
 def one_round():
+    global _cur_low, _cur_high
     last = get_last_price(SYMBOL)
     last_txt = fmt(last) if last is not None else "—"
 
-    levels = build_grid_levels(GRID_LOW, GRID_HIGH, STEP)
-    print(f"[BOT] Grid-Start • Symbol={SYMBOL} • Range={GRID_LOW}-{GRID_HIGH} • TP={TP_PCT*100:.1f}% • QTY/Level={QTY}", flush=True)
+    # Recenter-Check
+    if AUTO_RECENTER:
+        _cur_low, _cur_high, recentered = apply_recenter_if_needed(last)
+        if recentered:
+            # nach Recenter die Levels neu setzen
+            pass
+
+    levels = build_grid_levels(_cur_low, _cur_high, STEP)
+    print(
+        f"[BOT] Grid-Start • Symbol={SYMBOL} • Range={_cur_low}-{_cur_high} • "
+        f"TP={TP_PCT*100:.1f}% • QTY/Level={QTY}",
+        flush=True,
+    )
     print(f"[BOT] Last={last_txt}", flush=True)
 
-    buys = [p for p in levels if p <= GRID_HIGH]
+    buys = [p for p in levels if p <= _cur_high]
     submit_grid_buys(SYMBOL, buys, QTY, MAX_ORDERS_PER_LOOP)
     submit_tp_sells_for_fills(SYMBOL, TP_PCT, max_orders=MAX_ORDERS_PER_LOOP)
 
     print("[BOT] Runde fertig.", flush=True)
 
 def main():
+    global _cur_low, _cur_high
+    _cur_low, _cur_high = GRID_LOW, GRID_HIGH
+
     if REBUILD_ON_START:
         print("[BOT] REBUILD_ON_START aktiv → offene Orders canceln & Grid neu setzen.", flush=True)
         n = cancel_open_grid_orders(SYMBOL)
         print(f"[BOT] {n} offene Orders storniert.", flush=True)
 
+    # Erste Runde
     one_round()
 
+    # Loop
     if any(arg in os.getenv("LOOP", "--loop") for arg in ["--loop", "1", "true"]):
         while True:
             try:
